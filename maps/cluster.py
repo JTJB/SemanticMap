@@ -58,6 +58,27 @@ def run_dbscan_on_map(map_file, yaml_file):
         
         class_member_mask = (labels == k)
         xy = points[class_member_mask]
+
+        # bounding box
+        xmin = xy[:,0].min()
+        xmax = xy[:,0].max()
+        ymin = xy[:,1].min()
+        ymax = xy[:,1].max()
+
+        width  = xmax - xmin
+        height = ymax - ymin
+
+        # size filter
+        if not (0 <= width <= 0.4 and 0 <= height <= 0.8):
+            continue
+
+        mu = xy.mean(axis=0)
+        U, S, Vt = np.linalg.svd(xy - mu, full_matrices=False)
+        ratio = S[1] / S[0]
+
+        if ratio < 0.5:
+            continue  # line-like cluster
+
         plt.scatter(xy[:, 0], xy[:, 1], 
                    c=[col], 
                    s=1,
