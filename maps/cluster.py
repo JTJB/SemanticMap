@@ -31,7 +31,7 @@ def run_dbscan_on_map(map_file, yaml_file):
     # Run DBSCAN
     # eps = maximum distance between two points to be in same cluster
     # min_samples = minimum points to form a cluster
-    dbscan = DBSCAN(eps=0.1, min_samples=10)
+    dbscan = DBSCAN(eps=0.2, min_samples=70)
     labels = dbscan.fit_predict(points)
     
     # Get number of clusters (excluding noise = -1)
@@ -71,13 +71,26 @@ def run_dbscan_on_map(map_file, yaml_file):
         # size filter
         if not (0 <= width <= 0.4 and 0 <= height <= 0.8):
             continue
-
+        
         mu = xy.mean(axis=0)
         U, S, Vt = np.linalg.svd(xy - mu, full_matrices=False)
         ratio = S[1] / S[0]
 
         if ratio < 0.5:
             continue  # line-like cluster
+
+        
+        plt.gca().add_patch(
+            plt.Rectangle(
+                (xmin, ymin),
+                width,
+                height,
+                fill=False,
+                edgecolor='red',
+                linewidth=1
+            )
+        )
+
 
         plt.scatter(xy[:, 0], xy[:, 1], 
                    c=[col], 
