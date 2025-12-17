@@ -1,0 +1,6 @@
+image: /home/ting/maps/17Dec_0.05.pgm
+resolution: 0.050000
+origin: [-9.463544, -8.419904, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
