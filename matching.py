@@ -19,6 +19,7 @@ from sklearn.cluster import DBSCAN
 from rclpy.qos import QoSProfile, ReliabilityPolicy  
 from visualization_msgs.msg import Marker, MarkerArray
 from collections import deque
+from collections import defaultdict
 
 
 # edited
@@ -37,7 +38,7 @@ class LidarCamBasePolarNode(Node):
         self.bridge = CvBridge()
         # COCOデータセット基準 : person=0, chair=56, table=60
         self.target_classes = {'chair': 56, 'person': 0, 'table':60}
-        self.conf_threshold = 0.05 #0.3
+        self.conf_threshold = 0.3 #0.3
         
         # 2. Parameters
         # 解像度
@@ -99,7 +100,7 @@ class LidarCamBasePolarNode(Node):
         self.tracker = sort.SORT()
 
         # 10. Timer
-        self.create_timer(2.0, self.timer_callback)
+        self.create_timer(0.5, self.timer_callback)
         
         # 11. MarkerArray publisher (RViz視覚化)
         self.marker_pub = self.create_publisher(MarkerArray, "visualization_marker_array", 10)
@@ -224,6 +225,7 @@ class LidarCamBasePolarNode(Node):
         detections_file = self.folder + "/lidar_detections.txt"
         grid_file = self.folder + "/lidar_grid.txt"
         conf_file = self.folder + "/conf_grid.txt"
+        semantic_file = self.folder + "/semantic_grid.txt"
 
         # 🔹 出力ディレクトリを自動作成
         output_dir = os.path.dirname(detections_file)
@@ -325,7 +327,7 @@ class LidarCamBasePolarNode(Node):
                     continue
                 conf_line = f"{label},{best_conf:.2f},{i},{j}\n"
                 conf_lines.append(conf_line)
-        
+
         # 4. conf_grid.txtに記録
         try:
             with open(conf_file, "w") as f:
@@ -388,12 +390,20 @@ class LidarCamBasePolarNode(Node):
             queue = deque()
             queue.append((seed_i, seed_j))
             region.add((seed_i, seed_j))
+            max_x = -1000000
+            min_x = 1000000
+            max_y = -1000000
+            min_y = 1000000
             directions = [(dx, dy) for dx in [-1, 0, 1] for dy in [-1, 0, 1] if not (dx == 0 and dy == 0)]
-            while queue:
+            while queue and len(region) < 70:
                 cx, cy = queue.popleft()
                 for dx, dy in directions:
                     nx = cx + dx
                     ny = cy + dy
+                    if nx < min_x: min_x = nx
+                    if nx > max_x: max_x = nx
+                    if ny < min_y: min_y = ny
+                    if ny > max_y: max_y = ny
                     if nx < 0 or nx >= width or ny < 0 or ny >= height:
                         continue
                     if (nx, ny) in region:
@@ -401,6 +411,8 @@ class LidarCamBasePolarNode(Node):
                     if occupancy_grid[ny, nx] >= self.occupancy_threshold:
                         region.add((nx, ny))
                         queue.append((nx, ny))
+            if len(region) > 68 or max_x - min_x > 15 or max_y - min_y > 15:
+                continue
 
             # merge_regionの検索
             merged_label = self.merge_region(label, region, semantic_assignments, threshold=0.5)
