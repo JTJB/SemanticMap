@@ -58,25 +58,25 @@ class LidarCamBasePolarNode(Node):
             0.0008145218734235378, 5.778678686282746e-06,
             -0.02491904639602924
         ])    
-        # # Extrinsic Parameter    
-        # self.extrinsic_matrix = np.array([
-        #     [-1.0, 0.0, -7.34641021e-06, -1.96900963e-07],
-        #     [7.34641021e-06, 3.67320510e-06, -1.0, -5.36000000e-02],
-        #     [0.0, -1.0, -3.67320510e-06, -3.49000000e-02],
-        #     [0.0, 0.0, 0.0, 1.0]
-        # ])
-
+        # Extrinsic Parameter    
         self.extrinsic_matrix = np.array([
-            [ 0.0, -1.0, -3.67320510e-06, -3.49000000e-02],
-            [ 7.34641021e-06, 3.67320510e-06, -1.0, -5.36000000e-02],
-            [ 1.0, 0.0, 7.34641021e-06, 1.96900963e-07],
-            [ 0.0, 0.0, 0.0, 1.0]
+            [-1.0, 0.0, -7.34641021e-06, -1.96900963e-07],
+            [7.34641021e-06, 3.67320510e-06, -1.0, -5.36000000e-02],
+            [0.0, -1.0, -3.67320510e-06, -3.49000000e-02],
+            [0.0, 0.0, 0.0, 1.0]
         ])
+
+        # self.extrinsic_matrix = np.array([
+        #     [ 0.0, -1.0, -3.67320510e-06, -3.49000000e-02],
+        #     [ 7.34641021e-06, 3.67320510e-06, -1.0, -5.36000000e-02],
+        #     [ 1.0, 0.0, 7.34641021e-06, 1.96900963e-07],
+        #     [ 0.0, 0.0, 0.0, 1.0]
+        # ])
 
         
         # 3. トピック設定
         self.camera_topic = '/kachaka/front_camera/image_raw/compressed'
-        self.lidar_topic  = '/scan_matched_points2'
+        self.lidar_topic  = '/kachaka/lidar/scan'
         self.odometry_topic  = '/kachaka/odometry/odometry'
         self.tf_topic = '/tf'
         self.map_topic = '/map'
@@ -87,7 +87,7 @@ class LidarCamBasePolarNode(Node):
         
         # 5. Subscription生成
         self.create_subscription(CompressedImage, self.camera_topic, self.camera_callback, qos_profile_best_effort)
-        self.create_subscription(PointCloud2, self.lidar_topic, self.lidar_callback, qos_profile_best_effort)
+        self.create_subscription(LaserScan, self.lidar_topic, self.lidar_callback, qos_profile_best_effort)
         self.create_subscription(Odometry, self.odometry_topic, self.odometry_callback, qos_profile_best_effort)
         self.create_subscription(OccupancyGrid, self.map_topic, self.map_callback, qos_profile_tf)
         
@@ -181,7 +181,7 @@ class LidarCamBasePolarNode(Node):
             'yaw': yaw,
             'grid_data': grid_data
         }
-        self.get_logger().info("Map updated.")
+        self.get_logger().error("Map updated. ")
     
     
     # (x, y)座標を/map基準のgrid cell (i, j)に変換
@@ -317,6 +317,7 @@ class LidarCamBasePolarNode(Node):
                 groups[label] = {}
             key = (i, j)
             groups[label][key] = groups[label].get(key, 0.0) + conf_val
+        self.get_logger().info("Grouped confidence sums calculated.")
         
         # 3. 各IDごとに累積信頼度が最も大きいセル(シード)を選択（合計が5を超えなければ保存しない）
         conf_lines = []
@@ -324,30 +325,31 @@ class LidarCamBasePolarNode(Node):
             if not cell_dict:
                 continue
             sorted_cells = sorted(cell_dict.items(), key=lambda x: x[1], reverse=True)
-            chosen = []
-            if len(chosen) < 5:
-                for (cell, conf_sum) in sorted_cells:
-                    i, j = cell
+            chosen = None
+            for (cell, conf_sum) in sorted_cells:
+                i, j = cell
 
-                    # ✅ Add bounds checking
-                    if i < 0 or i >= self.map_info['width'] or j < 0 or j >= self.map_info['height']:
-                        continue
+                # ✅ Add bounds checking
+                if i < 0 or i >= self.map_info['width'] or j < 0 or j >= self.map_info['height']:
+                    continue
 
-                    if self.map_info['grid_data'][j, i] >= self.occupancy_threshold:
-                        chosen.append((cell, conf_sum))
-                        break
-            # if chosen:
-            #     (i, j), best_conf = chosen[0]
-            #     if best_conf <= 5:
-            #         continue
-            #     conf_line = f"{label},{best_conf:.2f},{i},{j}\n"
-            #     conf_lines.append(conf_line)
-            for (cell, best_conf) in chosen:
-                (i, j) = cell
+                if self.map_info['grid_data'][j, i] >= self.occupancy_threshold:
+                    chosen = (cell, conf_sum)
+                    break
+
+            if chosen is not None:
+                (i, j), best_conf = chosen
                 # if best_conf <= 5:
                 #     continue
                 conf_line = f"{label},{best_conf:.2f},{i},{j}\n"
                 conf_lines.append(conf_line)
+
+            # for (cell, best_conf) in chosen:
+            #     (i, j) = cell
+            #     if best_conf <= 5:
+            #         continue
+            #     conf_line = f"{label},{best_conf:.2f},{i},{j}\n"
+            #     conf_lines.append(conf_line)
 
         # 4. conf_grid.txtに記録
         try:
@@ -367,74 +369,74 @@ class LidarCamBasePolarNode(Node):
         semantic_file = self.folder + "/semantic_grid.txt"
         grid_file = self.folder + "/lidar_grid.txt"
 
-        # 1. conf_grid.txt読み込み
-        try:
-            with open(conf_file, "r") as f:
-                conf_lines = f.readlines()
-        except Exception as e:
-            self.get_logger().error(f"Failed to read conf grid file: {e}")
-            return
-        if not conf_lines:
-            self.get_logger().warn("No conf_lines found; skipping semantic marker publish.")
-            return
+        # # 1. conf_grid.txt読み込み
+        # try:
+        #     with open(conf_file, "r") as f:
+        #         conf_lines = f.readlines()
+        # except Exception as e:
+        #     self.get_logger().error(f"Failed to read conf grid file: {e}")
+        #     return
+        # if not conf_lines:
+        #     self.get_logger().warn("No conf_lines found; skipping semantic marker publish.")
+        #     return
 
-        # 2. /mapのOccupancyGrid情報を利用
-        if self.map_info is None or 'grid_data' not in self.map_info:
-            self.get_logger().warn("Map info or grid_data not available yet.")
-            return
-        occupancy_grid = self.map_info['grid_data']
-        height = self.map_info['height']
-        width = self.map_info['width']
+        # # 2. /mapのOccupancyGrid情報を利用
+        # if self.map_info is None or 'grid_data' not in self.map_info:
+        #     self.get_logger().warn("Map info or grid_data not available yet.")
+        #     return
+        # occupancy_grid = self.map_info['grid_data']
+        # height = self.map_info['height']
+        # width = self.map_info['width']
 
-        # 3. conf_grid.txtの各シードから8方向BFS検索実行
+        # # 3. conf_grid.txtの各シードから8方向BFS検索実行
         semantic_assignments = {}  # { label: set((i, j), ...) }
-        for line in conf_lines:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split(',')
-            if len(parts) != 4:
-                self.get_logger().warn(f"Unexpected conf grid line: {line}")
-                continue
-            label = parts[0]
-            try:
-                seed_i = int(parts[2])
-                seed_j = int(parts[3])
-            except Exception:
-                self.get_logger().warn(f"Failed to parse conf grid line: {line}")
-                continue
-            if seed_i < 0 or seed_i >= width or seed_j < 0 or seed_j >= height:
-                continue
-            if occupancy_grid[seed_j, seed_i] < self.occupancy_threshold:
-                continue
+        # for line in conf_lines:
+        #     line = line.strip()
+        #     if not line:
+        #         continue
+        #     parts = line.split(',')
+        #     if len(parts) != 4:
+        #         self.get_logger().warn(f"Unexpected conf grid line: {line}")
+        #         continue
+        #     label = parts[0]
+        #     try:
+        #         seed_i = int(parts[2])
+        #         seed_j = int(parts[3])
+        #     except Exception:
+        #         self.get_logger().warn(f"Failed to parse conf grid line: {line}")
+        #         continue
+        #     if seed_i < 0 or seed_i >= width or seed_j < 0 or seed_j >= height:
+        #         continue
+        #     if occupancy_grid[seed_j, seed_i] < self.occupancy_threshold:
+        #         continue
 
-            region = set()
-            queue = deque()
-            queue.append((seed_i, seed_j))
-            region.add((seed_i, seed_j))
+        #     region = set()
+        #     queue = deque()
+        #     queue.append((seed_i, seed_j))
+        #     region.add((seed_i, seed_j))
 
-            directions = [(dx, dy) for dx in [-1, 0, 1] for dy in [-1, 0, 1] if not (dx == 0 and dy == 0)]
-            while queue and len(region) < 70:
-                cx, cy = queue.popleft()
-                for dx, dy in directions:
-                    nx = cx + dx
-                    ny = cy + dy
+        #     directions = [(dx, dy) for dx in [-1, 0, 1] for dy in [-1, 0, 1] if not (dx == 0 and dy == 0)]
+        #     while queue and len(region) < 70:
+        #         cx, cy = queue.popleft()
+        #         for dx, dy in directions:
+        #             nx = cx + dx
+        #             ny = cy + dy
 
-                    if nx < 0 or nx >= width or ny < 0 or ny >= height:
-                        continue
-                    if (nx, ny) in region:
-                        continue
-                    # if occupancy_grid[ny, nx] >= self.occupancy_threshold:
-                    #     region.add((nx, ny))
-                    #     queue.append((nx, ny))
+        #             if nx < 0 or nx >= width or ny < 0 or ny >= height:
+        #                 continue
+        #             if (nx, ny) in region:
+        #                 continue
+        #             # if occupancy_grid[ny, nx] >= self.occupancy_threshold:
+        #             #     region.add((nx, ny))
+        #             #     queue.append((nx, ny))
 
 
-            # merge_regionの検索
-            merged_label = self.merge_region(label, region, semantic_assignments, threshold=0.5)
-            if merged_label in semantic_assignments:
-                semantic_assignments[merged_label] = semantic_assignments[merged_label].union(region)
-            else:
-                semantic_assignments[merged_label] = region
+        #     # merge_regionの検索
+        #     merged_label = self.merge_region(label, region, semantic_assignments, threshold=0.5)
+        #     if merged_label in semantic_assignments:
+        #         semantic_assignments[merged_label] = semantic_assignments[merged_label].union(region)
+        #     else:
+        #         semantic_assignments[merged_label] = region
 
         # 4. semantic_grid.txtに保存
         semantic_lines = []
@@ -462,7 +464,7 @@ class LidarCamBasePolarNode(Node):
                     tmp[label] = set()
 
                 tmp[label].add((x, y))
-                semantic_lines.append(f"{row[2]},{row[4]},{row[5]}\n")
+                semantic_lines.append(f"{row[2]},({row[4]},{row[5]})\n")
         try:
             with open(semantic_file, "w") as f:
                 f.writelines(semantic_lines)
@@ -473,9 +475,8 @@ class LidarCamBasePolarNode(Node):
         # 5. Cube Marker & Text Marker pub
         markers = MarkerArray()
         marker_id = 0
-        for label, cells in semantic_assignments.items():
-            if not cells:
-                continue
+        for label, cells in tmp.items():
+
             r, g, b = self.get_color_for_label(label)
 
             # セル群の重心を map 座標で計算
@@ -571,6 +572,8 @@ class LidarCamBasePolarNode(Node):
                 if conf >= self.conf_threshold:
                     track_id = int(box.id[0]) if box.id is not None else -1
                     x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                    x2 = int(x2 - (x2-x1) * 0.3)
+                    x1 = int(x1 + (x2 - x1) * 0.3)
                     cls_id = int(box.cls[0])
                     label = [name for name, cid in self.target_classes.items() if cid == cls_id][0]
                     combined_label = f"id:{track_id} {label}" if track_id >= 0 else label
@@ -621,24 +624,24 @@ class LidarCamBasePolarNode(Node):
         self.camera_msgs.append((msg, ts))
 
     # LiDAR コールバック関数
-    # def lidar_callback(self, msg):
-    #     self.get_logger().info("LiDAR message received")
-    #     ts = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
-    #     ranges = np.array(msg.ranges)
-    #     angles = np.linspace(msg.angle_min, msg.angle_max, len(ranges))
-    #     x = ranges * np.cos(angles)
-    #     y = ranges * np.sin(angles)
-    #     point_cloud = np.stack([x, y], axis=1)
-    #     self.lidar_msgs.append((msg, ts, point_cloud))
-
     def lidar_callback(self, msg):
         self.get_logger().info("LiDAR message received")
         ts = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
-        points = list(point_cloud2.read_points(msg, field_names=("x", "y"), skip_nans=True) )
-        if not points:
-            return
-        point_cloud = np.array(points)
+        ranges = np.array(msg.ranges)
+        angles = np.linspace(msg.angle_min, msg.angle_max, len(ranges))
+        x = ranges * np.cos(angles)
+        y = ranges * np.sin(angles)
+        point_cloud = np.stack([x, y], axis=1)
         self.lidar_msgs.append((msg, ts, point_cloud))
+
+    # def lidar_callback(self, msg):
+    #     self.get_logger().info("LiDAR message received")
+    #     ts = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
+    #     points = list(point_cloud2.read_points(msg, field_names=("x", "y"), skip_nans=True) )
+    #     if not points:
+    #         return
+    #     point_cloud = np.array(points)
+    #     self.lidar_msgs.append((msg, ts, point_cloud))
     
     
     # Odometry コールバック関数
@@ -667,60 +670,28 @@ class LidarCamBasePolarNode(Node):
     
     # LiDAR データ処理&保存
     def lidar_process_and_save(self, lidar_msg, bounding_boxes, sec, nsec, image=None):
-        # ranges = np.array(lidar_msg.ranges)
-        # angles = np.linspace(lidar_msg.angle_min, lidar_msg.angle_max, len(ranges))        
-        # lidar_4d = np.vstack([
-        #     ranges * np.cos(angles),
-        #     ranges * np.sin(angles),
-        #     np.zeros_like(ranges),
-        #     np.ones_like(ranges)
-        # ])
-
-        points = read_points_numpy(lidar_msg, field_names=("x", "y"), skip_nans=True)
-
-        x = points[:,0]
-        y = points[:,1]  
+        ranges = np.array(lidar_msg.ranges)
+        angles = np.linspace(lidar_msg.angle_min, lidar_msg.angle_max, len(ranges))        
         lidar_4d = np.vstack([
-            x,
-            y,
-            np.zeros_like(x),
-            np.ones_like(x)
+            ranges * np.cos(angles),
+            ranges * np.sin(angles),
+            np.zeros_like(ranges),
+            np.ones_like(ranges)
         ])
         
-        # After extrinsic transformation
+        # extrinsic変換
         cam_4d = self.extrinsic_matrix @ lidar_4d
-        x_cam = cam_4d[0, :]
-        y_cam = cam_4d[1, :]
-        z_cam = cam_4d[2, :]
-
-        # Simple and clear filtering
-        min_depth = 0.1
-        max_depth = 10.0
-
-        # Angle from optical axis (only makes sense if z > 0)
-        angle_x = np.arctan2(np.abs(x_cam), z_cam)
-        angle_y = np.arctan2(np.abs(y_cam), z_cam)
-
-        fov_x_half = np.deg2rad(54.3)
-        fov_y_half = np.deg2rad(37.5)
-
-        # Combined filter: must satisfy ALL conditions
-        front = (
-            (z_cam > min_depth) &           # In front, not too close
-            (z_cam < max_depth) &           # Not too far
-            (angle_x < fov_x_half) &        # Within horizontal FOV
-            (angle_y < fov_y_half)          # Within vertical FOV
-        )
-
+        z = cam_4d[2, :]
+        front = (z > 0)
         if not np.any(front):
+            # Publish image even if no points
             if image is not None:
                 uncompressed_msg = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
                 self.image_pub.publish(uncompressed_msg)
-            return
-
+            return        
         cam_4d = cam_4d[:, front]
         
-        # Intrinsic transformation
+        # intrinsic変換
         uv = self.camera_matrix @ cam_4d[:3, :]
         uv /= cam_4d[2, :]
         pts_2d = uv[:2, :].T        
@@ -743,8 +714,8 @@ class LidarCamBasePolarNode(Node):
                     cv2.circle(image, (ix, iy), radius=2, color=color, thickness=-1)
 
         valid_idx = np.where(front)[0]
-
-        matched_xy = []
+        matched_pts_polar = []
+        
         for i, (px, py) in enumerate(pts_2d):
             ix = int(px)
             iy = int(py)
@@ -755,45 +726,41 @@ class LidarCamBasePolarNode(Node):
                         boxes_found.append((combined_label, cconf))
                 if len(boxes_found) == 1:
                     clabel, cconf = boxes_found[0]
-                    # Get original range and angle (before filtering)
-                    original_idx = valid_idx[i]
-                    matched_xy.append([x[original_idx], y[original_idx], clabel, cconf])   
-                    self.get_logger().info(f"Matched LiDAR point to box: {clabel} with confidence {cconf:.2f}") 
-
-        if len(matched_xy) > 500:
-            matched_xy = matched_xy[:500]
-
+                    idx = valid_idx[i]
+                    r = ranges[idx]
+                    th = angles[idx]
+                    matched_pts_polar.append([r, th, clabel, cconf])
+        
         # Publish the image with both bounding boxes AND LiDAR points
         if image is not None:
             uncompressed_msg = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
             self.image_pub.publish(uncompressed_msg)    
-
-             # --- SAFETY GUARD 2: DBSCAN sanity check ---
-            if len(matched_xy) < 20:
-                return
-
-            matched_xy_stripped = np.array(
-                [(pt[0], pt[1]) for pt in matched_xy],
-                dtype=np.float32
-            )
-
-            db = DBSCAN(eps=0.1, min_samples=10).fit(matched_xy_stripped)
-            self.get_logger().info(f"DBSCAN completed. Labels: {db.labels_}")
-            self.get_logger().info(f"Number of clusters: {len(set(db.labels_)) - (1 if -1 in db.labels_ else 0)}")
-            self.get_logger().info("Continuing to odometry check...")
+        depths = [r for (r, th, _, _) in matched_pts_polar]
+        min_depth = np.percentile(depths, 10)
+        filtered = []
+        for pt in matched_pts_polar:
+            r, th, clabel, cconf = pt
+            if r < min_depth + 0.3:
+                filtered.append(pt)
+        if matched_pts_polar:
+            self.get_logger().info(f"Matched LiDAR point cloud count: {len(matched_pts_polar)}")
+            
+            # (A) DBSCANフィルタリング
+            matched_xy = []
+            for (r, th, clabel, cconf) in matched_pts_polar:
+                x = r * math.cos(th)
+                y = r * math.sin(th)
+                matched_xy.append([x, y])
+            matched_xy = np.array(matched_xy)            
+            db = DBSCAN(eps=0.1, min_samples=10).fit(matched_xy)
             labels = db.labels_
+            cluster_idx = np.where(labels != -1)[0]
+            if len(cluster_idx) == 0:
+                self.get_logger().info("No cluster")
+                return            
+            # filtered_matched_pts = [matched_pts_polar[i] for i in cluster_idx]
+            filtered_matched_pts = matched_pts_polar
 
-            # Filter to keep only core points (not noise, label != -1)
-            filtered_matched = []
-            for i, label in enumerate(labels):
-                if label != -1:  # Not noise
-                    filtered_matched.append(matched_xy[i])
-
-            if len(filtered_matched) < 5:
-                self.get_logger().warn(f"After DBSCAN filtering, only {len(filtered_matched)} points remain")
-                return
-
-            matched_xy = filtered_matched  # Use filtered points
 
             # (B) オドメトリ変化確認（移動しなければ保存しない）
             if self.current_odometry is not None:
@@ -811,19 +778,25 @@ class LidarCamBasePolarNode(Node):
             detections_file = self.folder + "/lidar_detections.txt"
             try:
                 with open(detections_file, "a") as f:
-                    try:
-                        transform = self.tf_buffer.lookup_transform("map", "base_footprint", rclpy.time.Time())
-                    except Exception as e:
-                        self.get_logger().warn(f"TF lookup failure: {e}")
-                        return    
-
-                    for pt in matched_xy:
-                        x_robot, y_robot, clabel, cconf = pt
+                    for pt in filtered_matched_pts:
+                        r, th, clabel, cconf = pt
                         # 信頼度フィルタリング
                         if cconf < self.conf_threshold:
                             continue                       
+                        x_robot = r * math.sin(th + math.pi) + 0.156
+                        y_robot = -r * math.cos(th + math.pi)
+                        # x_robot = new_range * math.cos(new_angle)
+                        # y_robot = new_range * math.sin(new_angle)   
+                        
+                        
+                        # x_robot = r * math.cos(th)
+                        # y_robot = r * math.sin(th)
                                              
-                                          
+                        try:
+                            transform = self.tf_buffer.lookup_transform("map", "base_footprint", rclpy.time.Time())
+                        except Exception as e:
+                            self.get_logger().warn(f"TF lookup failure: {e}")
+                            continue                       
                         x_map, y_map = self.transform_point(x_robot, y_robot, transform)
                         line = f"{timestamp},{clabel},{cconf:.2f},{x_map:.3f},{y_map:.3f}\n"
                         f.write(line)
@@ -841,8 +814,10 @@ class LidarCamBasePolarNode(Node):
         q = transform.transform.rotation
         yaw = math.atan2(2 * (q.w * q.z + q.x * q.y),
                          1 - 2 * (q.y * q.y + q.z * q.z))
+        # yaw=2*math.asin(q.z)
         x_map = math.cos(yaw) * x - math.sin(yaw) * y + tx
         y_map = math.sin(yaw) * x + math.cos(yaw) * y + ty
+        self.get_logger().error(f"Yaw: {yaw:.3f}")
         return x_map, y_map
   
     

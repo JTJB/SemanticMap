@@ -687,43 +687,22 @@ class LidarCamBasePolarNode(Node):
             np.ones_like(x)
         ])
         
-        # After extrinsic transformation
+        # extrinsic変換
         cam_4d = self.extrinsic_matrix @ lidar_4d
-        x_cam = cam_4d[0, :]
-        y_cam = cam_4d[1, :]
-        z_cam = cam_4d[2, :]
-
-        # Simple and clear filtering
-        min_depth = 0.1
-        max_depth = 10.0
-
-        # Angle from optical axis (only makes sense if z > 0)
-        angle_x = np.arctan2(np.abs(x_cam), z_cam)
-        angle_y = np.arctan2(np.abs(y_cam), z_cam)
-
-        fov_x_half = np.deg2rad(54.3)
-        fov_y_half = np.deg2rad(37.5)
-
-        # Combined filter: must satisfy ALL conditions
-        front = (
-            (z_cam > min_depth) &           # In front, not too close
-            (z_cam < max_depth) &           # Not too far
-            (angle_x < fov_x_half) &        # Within horizontal FOV
-            (angle_y < fov_y_half)          # Within vertical FOV
-        )
-
+        z = cam_4d[2, :]
+        front = (z > 0)
         if not np.any(front):
+            # Publish image even if no points
             if image is not None:
                 uncompressed_msg = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
                 self.image_pub.publish(uncompressed_msg)
-            return
-
+            return        
         cam_4d = cam_4d[:, front]
         
-        # Intrinsic transformation
+        # intrinsic変換
         uv = self.camera_matrix @ cam_4d[:3, :]
         uv /= cam_4d[2, :]
-        pts_2d = uv[:2, :].T        
+        pts_2d = uv[:2, :].T          
         
         # 🔹 Draw LiDAR points: GREEN if inside bbox, RED if outside
         if image is not None:
@@ -760,18 +739,13 @@ class LidarCamBasePolarNode(Node):
                     matched_xy.append([x[original_idx], y[original_idx], clabel, cconf])   
                     self.get_logger().info(f"Matched LiDAR point to box: {clabel} with confidence {cconf:.2f}") 
 
-        if len(matched_xy) > 500:
-            matched_xy = matched_xy[:500]
-
         # Publish the image with both bounding boxes AND LiDAR points
         if image is not None:
             uncompressed_msg = self.bridge.cv2_to_imgmsg(image, encoding='bgr8')
             self.image_pub.publish(uncompressed_msg)    
 
              # --- SAFETY GUARD 2: DBSCAN sanity check ---
-            if len(matched_xy) < 20:
-                return
-
+        if len(matched_xy) < 20:
             matched_xy_stripped = np.array(
                 [(pt[0], pt[1]) for pt in matched_xy],
                 dtype=np.float32
