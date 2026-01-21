@@ -8,9 +8,10 @@ import os
 def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time', default='false')
     share_dir = get_package_share_directory('kachaka_nav2_bringup')
-    cartographer_ros_dir = get_package_share_directory('cartographer_ros')
-    rviz_config_file = os.path.join(
-        cartographer_ros_dir, 'configuration_files', 'demo_2d.rviz')
+    rviz_config_file = '/home/ting/ros2_ws/src/kachaka_cartographer/rviz/demo_2d.rviz'
+    # cartographer_ros_dir = get_package_share_directory('cartographer_ros')
+    # rviz_config_file = os.path.join(
+    #     cartographer_ros_dir, 'configuration_files', 'demo_2d.rviz')
     cartographer_config_dir = LaunchConfiguration('cartographer_config_dir',
                                                    default=os.path.join(share_dir, 'config'))
     configuration_basename = LaunchConfiguration(
