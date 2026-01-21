@@ -22,6 +22,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from visualization_msgs.msg import Marker, MarkerArray
 from collections import deque
 from collections import defaultdict
+from scipy.spatial import ConvexHull
+from matplotlib.patches import Polygon
 
 
 # edited
@@ -53,6 +55,7 @@ class UnionFind:
         root2 = self.find(label2)
         if root1 != root2:
             self.parent[root2] = root1
+
 
 
 # 初期設定
@@ -129,7 +132,10 @@ class LidarCamBasePolarNode(Node):
         # 7. Odometey変数
         self.current_odometry = None      
         self.last_saved_odometry = None   
-        self.odom_threshold = 0.00        
+        self.odom_threshold = 0.00  
+        self.outlier_percentile = 5.0    
+        self.hull_vertices = None   # Initialized to None to prevent AttributeError
+        self.hull_polygon = None 
         
         # 8. TF変数
         self.saved_transform = None
@@ -148,6 +154,8 @@ class LidarCamBasePolarNode(Node):
         
         # 13. Image publisher
         self.image_pub = self.create_publisher(Image, '/kachaka/front_camera/uncompressed', 10)
+
+        self.seeds={}
         
         
     # Markerの色設定
@@ -256,8 +264,7 @@ class LidarCamBasePolarNode(Node):
         x = origin_x + dx
         y = origin_y + dy
         return (x, y)
-    
-
+     
     # 2秒ごとにconf_grid.txtを読み込み、/map（OccupancyGrid）を参照して、conf_grid.txt内の各シードから8方向にBFS検索を実行し、その結果をsemantic_grid.txtファイルに保存し、MarkerArrayを生成してpub
     
     #add the unknown lidar points
@@ -270,13 +277,14 @@ class LidarCamBasePolarNode(Node):
         grid_file = self.folder + "/lidar_grid.txt"
         conf_file = self.folder + "/conf_grid.txt"
         semantic_file = self.folder + "/semantic_grid.txt"
+        boundary_file = self.folder + "/lidar_boundary.txt"
 
         # 🔹 出力ディレクトリを自動作成
         output_dir = os.path.dirname(detections_file)
         os.makedirs(output_dir, exist_ok=True)
 
         # 🔹 ファイルが存在しない場合は作成
-        for f in [detections_file, grid_file, conf_file]:
+        for f in [detections_file, grid_file, conf_file, boundary_file]:
             if not os.path.exists(f):
                 open(f, 'w').close()  # 空ファイルを作成
         
@@ -389,7 +397,7 @@ class LidarCamBasePolarNode(Node):
         for label, cells_dict in merged_groups.items():
             for (i, j), confidence in cells_dict.items():
                 conf_lines.append(f"{label},{confidence},{i},{j},\n")  # Include confidence in output
-
+    
         # 4. conf_grid.txtに記録
         try:
             with open(conf_file, "w") as f:
@@ -402,13 +410,12 @@ class LidarCamBasePolarNode(Node):
         self.publish_semantic_markers()
         
         
-
-
      # Marker生成&pub
     def publish_semantic_markers(self):
         conf_file = self.folder + "/conf_grid.txt"
         semantic_file = self.folder + "/semantic_grid.txt"
         grid_file = self.folder + "/lidar_grid.txt"
+        boundary_file = self.folder + "/lidar_boundary.txt"
 
         # # 1. conf_grid.txt読み込み
         # try:
@@ -493,6 +500,7 @@ class LidarCamBasePolarNode(Node):
                     continue
                 
                 row = line.split(',')
+            
                 
                 label = row[0].strip()
                 x = float(row[2].strip())
@@ -501,9 +509,31 @@ class LidarCamBasePolarNode(Node):
                     tmp[label] = set()
 
                 tmp[label].add((x, y))
-                semantic_lines.append(f"{row[0]},({row[2]},{row[3]})\n")
+
+
+
+        transform = self.tf_buffer.lookup_transform("map", "base_footprint", rclpy.time.Time())
+        tx = transform.transform.translation.x
+        ty = transform.transform.translation.y
+        for label, cells in tmp.items():
+            result = self.extract_perspective_seeds(list(cells), (tx, ty, 0.0))
+            if result is None:
+                self.get_logger().warn(f"Cluster '{label}' has < 5 points, skipping")
+                continue
+            lft, rgt, center = result
+            # Check if key exists; if not, create the set
+            if label not in self.seeds:
+                self.seeds[label] = set()
+            
+            self.seeds[label].add((float(lft[0]), float(lft[1])))
+            self.seeds[label].add((float(rgt[0]), float(rgt[1])))
+            semantic_lines.append(f"{label},({lft[0]}, {lft[1]})\n")
+            semantic_lines.append(f"{label},({rgt[0]}, {rgt[1]})\n")
+
+
+
         try:
-            with open(semantic_file, "w") as f:
+            with open(semantic_file, "a") as f:
                 f.writelines(semantic_lines)
             self.get_logger().info(f"Semantic grid updated with {len(semantic_lines)} cells.")
         except Exception as e:
@@ -512,7 +542,7 @@ class LidarCamBasePolarNode(Node):
         # 5. Cube Marker & Text Marker pub
         markers = MarkerArray()
         marker_id = 0
-        for label, cells in tmp.items():
+        for label, cells in self.seeds.items():
 
             r, g, b = self.get_color_for_label(label)
 
@@ -585,6 +615,97 @@ class LidarCamBasePolarNode(Node):
 
         self.marker_pub.publish(markers)
         self.get_logger().info(f"Published {len(markers.markers)} semantic markers.")
+
+    def extract_perspective_seeds(self, cluster_points, robot_pose):
+        """
+        Identifies Left, Right, and Center data from the current view.
+        """
+        if len(cluster_points) < 5:
+            return None
+
+        cluster_points = np.array(cluster_points)
+
+        # Calculate angle from robot position to point
+        rx, ry, _ = robot_pose
+        dx = cluster_points[:, 0] - rx
+        dy = cluster_points[:, 1] - ry
+        angles = np.arctan2(dy, dx)
+
+        # Sort points by angle
+        sorted_indices = np.argsort(angles)
+        sorted_points = cluster_points[sorted_indices]
+
+        # Select Left/Right Seeds with Drift/Smear Mitigation
+        n_points = len(sorted_points)
+        idx_right = int(n_points * (self.outlier_percentile / 100.0))
+        idx_left = int(n_points * (1.0 - (self.outlier_percentile / 100.0))) - 1
+
+        # Clamp indices
+        idx_right = max(0, idx_right)
+        idx_left = min(n_points - 1, idx_left)
+
+        seed_right = sorted_points[idx_right]
+        seed_left = sorted_points[idx_left]
+
+        # Calculate Center Line using centroid of visible cluster
+        centroid = np.mean(cluster_points, axis=0)
+        center_dir = centroid - np.array([rx, ry])
+
+        # Avoid division by zero
+        norm = np.linalg.norm(center_dir)
+        if norm > 0:
+            center_dir = center_dir / norm
+        else:
+            center_dir = np.array([1.0, 0.0])
+
+        return seed_left, seed_right, center_dir
+    
+    def _recompute_geometry(self, seeds):
+        if len(seeds) < 3:
+            return
+
+        points = np.array(seeds)
+
+        # 1. Compute Convex Hull
+        try:
+            # We check if points are not just copies or collinear
+            if np.unique(points, axis=0).shape[0] >= 3:
+                hull = ConvexHull(points)
+                self.hull_vertices = points[hull.vertices]
+        except Exception:
+            # Fallback to just the points if hull fails
+            self.hull_vertices = points
+
+    def classify_points(self, candidate_points):
+        """
+        Classifies new points as:
+        0: Inside Hull (Part of Object)
+        1: Buffer Zone (Near boundary, ignore)
+        2: Unknown Seed (Outside boundary, use for new clusters)
+        """
+        if self.hull_vertices is None or len(self.hull_vertices) < 3:
+             # Fallback: Everything is unknown if we haven't learned the object yet
+            return np.full(len(candidate_points), 2)
+
+        from matplotlib.path import Path
+        hull_path = Path(self.hull_vertices)
+
+        is_inside = hull_path.contains_points(candidate_points)
+        labels = np.zeros(len(candidate_points), dtype=int)
+
+        for i, p in enumerate(candidate_points):
+            if is_inside[i]:
+                labels[i] = 0 # Object
+            else:
+                # Calculate min distance to hull vertices for buffer check
+                dists = np.linalg.norm(self.hull_vertices - p, axis=1)
+                min_dist = np.min(dists)
+
+                if min_dist < self.expansion_buffer:
+                    labels[i] = 1 # Buffer/Gap
+                else:
+                    labels[i] = 2 # Seed for Unknown
+        return labels   
 
     # カメラコールバック関数 (Modified to draw bounding boxes)
     def camera_callback(self, msg):
@@ -854,7 +975,6 @@ class LidarCamBasePolarNode(Node):
         # yaw=2*math.asin(q.z)
         x_map = math.cos(yaw) * x - math.sin(yaw) * y + tx
         y_map = math.sin(yaw) * x + math.cos(yaw) * y + ty
-        self.get_logger().error(f"Yaw: {yaw:.3f}")
         return x_map, y_map
   
     

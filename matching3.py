@@ -22,44 +22,18 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from visualization_msgs.msg import Marker, MarkerArray
 from collections import deque
 from collections import defaultdict
+from boundary import BoundaryTracker
+from tf_transformations import euler_from_quaternion
 
 
 # edited
-def are_regions_adjacent(region1, region2, max_distance=2):
-    """
-    Check if two regions are close enough to merge.
-    Returns True if any cell in region1 is within max_distance of any cell in region2.
-    """
-    for (i1, j1) in region1:
-        for (i2, j2) in region2:
-            # Chebyshev distance (max of absolute differences)
-            distance = max(abs(i1 - i2), abs(j1 - j2))
-            if distance <= max_distance:
-                return True
-    return False
-
-# Union-Find structure for efficient merging
-class UnionFind:
-    def __init__(self, labels):
-        self.parent = {label: label for label in labels}
-    
-    def find(self, label):
-        if self.parent[label] != label:
-            self.parent[label] = self.find(self.parent[label])  # Path compression
-        return self.parent[label]
-    
-    def union(self, label1, label2):
-        root1 = self.find(label1)
-        root2 = self.find(label2)
-        if root1 != root2:
-            self.parent[root2] = root1
-
 
 # 初期設定
 class LidarCamBasePolarNode(Node):
     def __init__(self):
         super().__init__('lidar_cam_base_polar_node')
 
+        # creates a new folder every time the node is started
         folder_name = '/home/ting/output/folder_' + time.strftime("%Y_%m_%d_%H_%M_%S")
         os.mkdir(folder_name)
         self.folder=folder_name
@@ -138,7 +112,7 @@ class LidarCamBasePolarNode(Node):
         self.tracker = sort.SORT()
 
         # 10. Timer
-        self.create_timer(0.5, self.timer_callback)
+        self.create_timer(2.0, self.timer_callback)
         
         # 11. MarkerArray publisher (RViz視覚化)
         self.marker_pub = self.create_publisher(MarkerArray, "visualization_marker_array", 10)
@@ -148,6 +122,18 @@ class LidarCamBasePolarNode(Node):
         
         # 13. Image publisher
         self.image_pub = self.create_publisher(Image, '/kachaka/front_camera/uncompressed', 10)
+
+
+        # ファイルパス設定
+
+        self.conf_grid_file = self.folder + "/conf_grid.txt"
+        self.detections_file = self.folder + "/lidar_detections.txt"
+        self.semantic_file = self.folder + "/semantic_grid.txt"
+        self.grid_file = self.folder + "/lidar_grid.txt"
+        self.boundary_file = self.folder + "/boundary.txt"
+        for f in [self.conf_grid_file, self.detections_file, self.semantic_file, self.grid_file, self.boundary_file]:
+            if not os.path.exists(f):
+                open(f, 'w').close()
         
         
     # Markerの色設定
@@ -256,8 +242,7 @@ class LidarCamBasePolarNode(Node):
         x = origin_x + dx
         y = origin_y + dy
         return (x, y)
-    
-
+     
     # 2秒ごとにconf_grid.txtを読み込み、/map（OccupancyGrid）を参照して、conf_grid.txt内の各シードから8方向にBFS検索を実行し、その結果をsemantic_grid.txtファイルに保存し、MarkerArrayを生成してpub
     
     #add the unknown lidar points
@@ -275,10 +260,6 @@ class LidarCamBasePolarNode(Node):
         output_dir = os.path.dirname(detections_file)
         os.makedirs(output_dir, exist_ok=True)
 
-        # 🔹 ファイルが存在しない場合は作成
-        for f in [detections_file, grid_file, conf_file]:
-            if not os.path.exists(f):
-                open(f, 'w').close()  # 空ファイルを作成
         
         # 1. lidar_detections.txtを読み込み、各行ごとに/map基準のセル (i,j) を計算
         try:
@@ -315,12 +296,16 @@ class LidarCamBasePolarNode(Node):
             updated_line = f"{sec},{nsec},{cls},{conf},{i},{j}\n"
             updated_lines.append(updated_line)        
         try:
+            open(grid_file, 'w').close()
             with open(grid_file, "w") as f:
                 f.writelines(updated_lines)
             self.get_logger().info(f"Detection grid updated with {len(updated_lines)} entries.")
         except Exception as e:
             self.get_logger().error(f"Failed to write detection grid: {e}")
-        
+
+
+        self.create_boundary()    
+
         # 2. lidar_grid.txtを読み込み、ID&セルごとにYOLO信頼度の合計を計算
         try:
             with open(grid_file, "r") as f:
@@ -349,46 +334,37 @@ class LidarCamBasePolarNode(Node):
             groups[label][key] = groups[label].get(key, 0.0) + conf_val
         self.get_logger().info("Grouped confidence sums calculated.")
         
-        # Initialize Union-Find with all labels
-        uf = UnionFind(list(groups.keys()))
-
-        # Compare all pairs of regions
-        labels_list = list(groups.keys())
-        merge_count = 0
-
-        for i in range(len(labels_list)):
-            for j in range(i + 1, len(labels_list)):
-                label1 = labels_list[i]
-                label2 = labels_list[j]
-                
-                region1 = set(groups[label1].keys())
-                region2 = set(groups[label2].keys())
-                
-                if are_regions_adjacent(region1, region2, max_distance=2):
-                    uf.union(label1, label2)
-                    merge_count += 1
-                    self.get_logger().info(f"Merging '{label1}' and '{label2}' (adjacent regions)")
-
-        self.get_logger().info(f"Performed {merge_count} region merges")
-
-        # Build final merged groups with accumulated confidence
-        merged_groups = {}
-        for label, cells_dict in groups.items():
-            root_label = uf.find(label)
-            
-            if root_label not in merged_groups:
-                merged_groups[root_label] = {}
-            
-            # Accumulate confidence values for each cell
-            for cell, conf in cells_dict.items():
-                merged_groups[root_label][cell] = merged_groups[root_label].get(cell, 0.0) + conf
-
-
-        # 4. Write merged results
+        # 3. 各IDごとに累積信頼度が最も大きいセル(シード)を選択（合計が5を超えなければ保存しない）
         conf_lines = []
-        for label, cells_dict in merged_groups.items():
-            for (i, j), confidence in cells_dict.items():
-                conf_lines.append(f"{label},{confidence},{i},{j},\n")  # Include confidence in output
+        for label, cell_dict in groups.items():
+            if not cell_dict:
+                continue
+            sorted_cells = sorted(cell_dict.items(), key=lambda x: x[1], reverse=True)
+            chosen = None
+            for (cell, conf_sum) in sorted_cells:
+                i, j = cell
+
+                # ✅ Add bounds checking
+                if i < 0 or i >= self.map_info['width'] or j < 0 or j >= self.map_info['height']:
+                    continue
+
+                if self.map_info['grid_data'][j, i] >= self.occupancy_threshold:
+                    chosen = (cell, conf_sum)
+                    break
+
+            if chosen is not None:
+                (i, j), best_conf = chosen
+                # if best_conf <= 5:
+                #     continue
+                conf_line = f"{label},{best_conf:.2f},{i},{j}\n"
+                conf_lines.append(conf_line)
+
+            # for (cell, best_conf) in chosen:
+            #     (i, j) = cell
+            #     if best_conf <= 5:
+            #         continue
+            #     conf_line = f"{label},{best_conf:.2f},{i},{j}\n"
+            #     conf_lines.append(conf_line)
 
         # 4. conf_grid.txtに記録
         try:
@@ -401,14 +377,63 @@ class LidarCamBasePolarNode(Node):
         # 5. conf_grid.txt作成後、semantic marker関数を呼び出す
         self.publish_semantic_markers()
         
+    def create_boundary(self):
+        tracker = BoundaryTracker(outlier_percentile=10.0, expansion_buffer=0.5)
+        grid_file = self.folder + "/lidar_grid.txt"
+        boundary_file = self.folder + "/boundary.txt"
+
+
+        grid_array = []
+        with open(grid_file, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:  # Skip empty lines
+                    continue
+                
+                row = line.split(',')
+                
+                # Check if row has enough columns
+                if len(row) < 6:
+                    continue
+                
+                label = row[2].strip()
+                x = float(row[4].strip())
+                y = float(row[5].strip())
+                grid_array.append((x,y))
+
+        robot_pose = None
+        try:
+            transform = self.tf_buffer.lookup_transform("map", "base_footprint", rclpy.time.Time())
+            tx = transform.transform.translation.x
+            ty = transform.transform.translation.y
+            q = transform.transform.rotation
+            yaw = math.atan2(2 * (q.w * q.z + q.x * q.y),
+                         1 - 2 * (q.y * q.y + q.z * q.z))
+            robot_pose = (tx, ty, yaw)
+        
+        
+        except Exception as e:
+            self.get_logger().warn(f"TF lookup failure: {e}")
+
+        tracker.update(grid_array, robot_pose)
+
+        labels = tracker.classify_points(grid_array)
+        seeds = tracker.global_seeds
+        with open(boundary_file, "a") as f:
+            for (x, y )in seeds:
+                f.write(f"{x},{y}\n")
+
         
 
+
+        
 
      # Marker生成&pub
     def publish_semantic_markers(self):
         conf_file = self.folder + "/conf_grid.txt"
         semantic_file = self.folder + "/semantic_grid.txt"
         grid_file = self.folder + "/lidar_grid.txt"
+        boundary_file = self.folder + "/boundary.txt"
 
         # # 1. conf_grid.txt読み込み
         # try:
@@ -486,7 +511,7 @@ class LidarCamBasePolarNode(Node):
         #         semantic_lines.append(f"{label},{i},{j}\n")
         # Read the file and parse each line
         tmp = {}
-        with open(conf_file, "r") as f:
+        with open(boundary_file, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line:  # Skip empty lines
@@ -494,14 +519,16 @@ class LidarCamBasePolarNode(Node):
                 
                 row = line.split(',')
                 
-                label = row[0].strip()
-                x = float(row[2].strip())
-                y = float(row[3].strip())
+
+                
+                label = "id:0 chair"
+                x = float(row[0].strip())
+                y = float(row[1].strip())
                 if label not in tmp:
                     tmp[label] = set()
 
                 tmp[label].add((x, y))
-                semantic_lines.append(f"{row[0]},({row[2]},{row[3]})\n")
+                semantic_lines.append(f"id:0 chair,{x},{y}\n")
         try:
             with open(semantic_file, "w") as f:
                 f.writelines(semantic_lines)
@@ -609,8 +636,9 @@ class LidarCamBasePolarNode(Node):
                 if conf >= self.conf_threshold:
                     track_id = int(box.id[0]) if box.id is not None else -1
                     x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                    x2 = int(x2 - (x2-x1) * 0.3)
-                    x1 = int(x1 + (x2 - x1) * 0.3)
+                    percent_downscale = 0.0
+                    x2 = int(x2 - (x2-x1) * percent_downscale)
+                    x1 = int(x1 + (x2 - x1) * percent_downscale)
                     cls_id = int(box.cls[0])
                     label = [name for name, cid in self.target_classes.items() if cid == cls_id][0]
                     combined_label = f"id:{track_id} {label}" if track_id >= 0 else label
@@ -670,23 +698,20 @@ class LidarCamBasePolarNode(Node):
         y = ranges * np.sin(angles)
         point_cloud = np.stack([x, y], axis=1)
         self.lidar_msgs.append((msg, ts, point_cloud))
-
-    # def lidar_callback(self, msg):
-    #     self.get_logger().info("LiDAR message received")
-    #     ts = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
-    #     points = list(point_cloud2.read_points(msg, field_names=("x", "y"), skip_nans=True) )
-    #     if not points:
-    #         return
-    #     point_cloud = np.array(points)
-    #     self.lidar_msgs.append((msg, ts, point_cloud))
-    
     
     # Odometry コールバック関数
     def odometry_callback(self, msg):
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
-        self.current_odometry = (x, y)
-        self.get_logger().info(f"Odometry updated: x={x:.2f}, y={y:.2f}")
+         #Extract quaternion
+        orientation_q = msg.pose.pose.orientation
+        orientation_list = [orientation_q.x, orientation_q.y, orientation_q.z, orientation_q.w]
+        
+        # Convert to Euler angles
+        (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+        
+        self.current_odometry = (x, y, yaw) 
+        self.get_logger().info(f"Odometry updated: x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}")
     
     
     # バウンディングボックス内のLiDAR点群のマッチング処理
@@ -822,12 +847,8 @@ class LidarCamBasePolarNode(Node):
                             continue                       
                         x_robot = r * math.sin(th + math.pi) + 0.156
                         y_robot = -r * math.cos(th + math.pi)
-                        # x_robot = new_range * math.cos(new_angle)
-                        # y_robot = new_range * math.sin(new_angle)   
-                        
-                        
-                        # x_robot = r * math.cos(th)
-                        # y_robot = r * math.sin(th)
+
+
                                              
                         try:
                             transform = self.tf_buffer.lookup_transform("map", "base_footprint", rclpy.time.Time())
@@ -854,7 +875,6 @@ class LidarCamBasePolarNode(Node):
         # yaw=2*math.asin(q.z)
         x_map = math.cos(yaw) * x - math.sin(yaw) * y + tx
         y_map = math.sin(yaw) * x + math.cos(yaw) * y + ty
-        self.get_logger().error(f"Yaw: {yaw:.3f}")
         return x_map, y_map
   
     
@@ -893,6 +913,9 @@ class LidarCamBasePolarNode(Node):
             combined_label = f"{best_label}{track_id}" if best_label is not None else f"unknown{track_id}"
             self.get_logger().info(f"Tracking box created: {combined_label}")
         self.get_logger().info("Tracking result update complete")
+    
+
+
     
     
 def main(args=None):

@@ -22,6 +22,11 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 from visualization_msgs.msg import Marker, MarkerArray
 from collections import deque
 from collections import defaultdict
+from scipy.spatial import ConvexHull
+from matplotlib.patches import Polygon
+from geometry_msgs.msg import Point
+from std_msgs.msg import ColorRGBA
+import rclpy.time
 
 
 # edited
@@ -125,6 +130,8 @@ class LidarCamBasePolarNode(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.camera_msgs = [] 
         self.lidar_msgs = deque(maxlen=10)
+        self.hull_vertices = None   # Initialized to None to prevent AttributeError
+        self.hull_polygon = None 
         
         # 7. Odometey変数
         self.current_odometry = None      
@@ -142,6 +149,7 @@ class LidarCamBasePolarNode(Node):
         
         # 11. MarkerArray publisher (RViz視覚化)
         self.marker_pub = self.create_publisher(MarkerArray, "visualization_marker_array", 10)
+        self.hull_viz_pub = self.create_publisher(MarkerArray, '/hull_visualization', 10)
 
         # 12. occupancy値
         self.occupancy_threshold =70
@@ -317,7 +325,7 @@ class LidarCamBasePolarNode(Node):
         try:
             with open(grid_file, "w") as f:
                 f.writelines(updated_lines)
-            self.get_logger().info(f"Detection grid updated with {len(updated_lines)} entries.")
+
         except Exception as e:
             self.get_logger().error(f"Failed to write detection grid: {e}")
         
@@ -347,7 +355,7 @@ class LidarCamBasePolarNode(Node):
                 groups[label] = {}
             key = (i, j)
             groups[label][key] = groups[label].get(key, 0.0) + conf_val
-        self.get_logger().info("Grouped confidence sums calculated.")
+
         
         # Initialize Union-Find with all labels
         uf = UnionFind(list(groups.keys()))
@@ -367,9 +375,7 @@ class LidarCamBasePolarNode(Node):
                 if are_regions_adjacent(region1, region2, max_distance=2):
                     uf.union(label1, label2)
                     merge_count += 1
-                    self.get_logger().info(f"Merging '{label1}' and '{label2}' (adjacent regions)")
 
-        self.get_logger().info(f"Performed {merge_count} region merges")
 
         # Build final merged groups with accumulated confidence
         merged_groups = {}
@@ -384,6 +390,8 @@ class LidarCamBasePolarNode(Node):
                 merged_groups[root_label][cell] = merged_groups[root_label].get(cell, 0.0) + conf
 
 
+        self._recompute_geometry(merged_groups)
+
         # 4. Write merged results
         conf_lines = []
         for label, cells_dict in merged_groups.items():
@@ -394,7 +402,6 @@ class LidarCamBasePolarNode(Node):
         try:
             with open(conf_file, "w") as f:
                 f.writelines(conf_lines)
-            self.get_logger().info(f"Confidence grid updated with {len(conf_lines)} entries.")
         except Exception as e:
             self.get_logger().error(f"Failed to write confidence grid: {e}")
             
@@ -505,7 +512,6 @@ class LidarCamBasePolarNode(Node):
         try:
             with open(semantic_file, "w") as f:
                 f.writelines(semantic_lines)
-            self.get_logger().info(f"Semantic grid updated with {len(semantic_lines)} cells.")
         except Exception as e:
             self.get_logger().error(f"Failed to write semantic grid: {e}")
 
@@ -584,11 +590,11 @@ class LidarCamBasePolarNode(Node):
             markers.markers.append(text)
 
         self.marker_pub.publish(markers)
-        self.get_logger().info(f"Published {len(markers.markers)} semantic markers.")
+
 
     # カメラコールバック関数 (Modified to draw bounding boxes)
     def camera_callback(self, msg):
-        self.get_logger().info("Camera message received")
+
         try:
             # 画像の圧縮解凍
             cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -609,17 +615,27 @@ class LidarCamBasePolarNode(Node):
                 if conf >= self.conf_threshold:
                     track_id = int(box.id[0]) if box.id is not None else -1
                     x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                    x2 = int(x2 - (x2-x1) * 0.3)
-                    x1 = int(x1 + (x2 - x1) * 0.3)
+                    x2 = int(x2 - (x2-x1) * 0.0)
+                    x1 = int(x1 + (x2 - x1) * 0.0)
                     cls_id = int(box.cls[0])
                     label = [name for name, cid in self.target_classes.items() if cid == cls_id][0]
-                    combined_label = f"id:{track_id} {label}" if track_id >= 0 else label
+
+                    # in case the id slipped
+                    if not hasattr(self, 'untracked_counter'):
+                        self.untracked_counter = 10000  # Start high to avoid conflicts
+                    track_id = int(box.id[0]) if box.id is not None else self.untracked_counter
+                    if box.id is None:
+                        self.untracked_counter += 1
+                    combined_label = f"id:{track_id} {label}"  # Always has ID now
+
+
                     bboxes.append((x1, y1, x2, y2, combined_label, conf))
                     
                     # Draw bounding box on the image
                     color = (0, 255, 0) if label == 'person' else (255, 0, 0)
                     cv2.rectangle(annotated_image, (x1, y1), (x2, y2), color, 2)
                     
+
                     # Draw label with confidence
                     label_text = f"{combined_label} {conf:.2f}"
                     
@@ -649,7 +665,7 @@ class LidarCamBasePolarNode(Node):
                     )
         
         if bboxes:
-            self.get_logger().info("Valid tracking box created")
+
             # 🔹 Pass annotated_image to process LiDAR points
             self.process_one_frame_with_boxes(msg, bboxes, annotated_image)
         else:
@@ -662,7 +678,7 @@ class LidarCamBasePolarNode(Node):
 
     # LiDAR コールバック関数
     def lidar_callback(self, msg):
-        self.get_logger().info("LiDAR message received")
+
         ts = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
         ranges = np.array(msg.ranges)
         angles = np.linspace(msg.angle_min, msg.angle_max, len(ranges))
@@ -780,7 +796,7 @@ class LidarCamBasePolarNode(Node):
             if r < min_depth + 0.3:
                 filtered.append(pt)
         if matched_pts_polar:
-            self.get_logger().info(f"Matched LiDAR point cloud count: {len(matched_pts_polar)}")
+
             
             # (A) DBSCANフィルタリング
             matched_xy = []
@@ -791,10 +807,19 @@ class LidarCamBasePolarNode(Node):
             matched_xy = np.array(matched_xy)            
             db = DBSCAN(eps=0.1, min_samples=10).fit(matched_xy)
             labels = db.labels_
-            cluster_idx = np.where(labels != -1)[0]
-            if len(cluster_idx) == 0:
-                self.get_logger().info("No cluster")
-                return            
+            # Keep only the largest cluster
+            unique_labels = set(labels) - {-1}  # Exclude noise (-1)
+
+            if len(unique_labels) == 0:
+                self.get_logger().info("No valid clusters after DBSCAN")
+                return
+
+            # Find the largest cluster
+            largest_cluster_label = max(unique_labels, key=lambda l: np.sum(labels == l))
+            cluster_idx = np.where(labels == largest_cluster_label)[0]
+
+            self.get_logger().info(f"Kept largest cluster: {len(cluster_idx)} points (from {len(matched_pts_polar)} total)")
+                    
             filtered_matched_pts = [matched_pts_polar[i] for i in cluster_idx]
             # filtered_matched_pts = matched_pts_polar
 
@@ -837,7 +862,6 @@ class LidarCamBasePolarNode(Node):
                         x_map, y_map = self.transform_point(x_robot, y_robot, transform)
                         line = f"{timestamp},{clabel},{cconf:.2f},{x_map:.3f},{y_map:.3f}\n"
                         f.write(line)
-                self.get_logger().info("Lidar detections appended.")
             except Exception as e:
                 self.get_logger().error(f"Failed to write lidar detections: {e}")
         else:
@@ -854,7 +878,6 @@ class LidarCamBasePolarNode(Node):
         # yaw=2*math.asin(q.z)
         x_map = math.cos(yaw) * x - math.sin(yaw) * y + tx
         y_map = math.sin(yaw) * x + math.cos(yaw) * y + ty
-        self.get_logger().error(f"Yaw: {yaw:.3f}")
         return x_map, y_map
   
     
@@ -893,7 +916,156 @@ class LidarCamBasePolarNode(Node):
             combined_label = f"{best_label}{track_id}" if best_label is not None else f"unknown{track_id}"
             self.get_logger().info(f"Tracking box created: {combined_label}")
         self.get_logger().info("Tracking result update complete")
+
+    def _recompute_geometry(self, merged_groups):
+        """Extract all cell positions and compute convex hull"""
+        
+        # Collect all cells from all labels
+        all_points = []
+        for label, cells_dict in merged_groups.items():
+            for (i, j) in cells_dict.keys():
+                # Convert grid cell to map coordinates
+                map_pos = self.cell_to_map(i, j)
+                if map_pos is not None:
+                    all_points.append(map_pos)
+        
+        if len(all_points) < 3:
+            self.get_logger().warn(f"Not enough points for hull: {len(all_points)}")
+            return
+        
+        points = np.array(all_points)
+        
+        # Compute Convex Hull
+        try:
+            if np.unique(points, axis=0).shape[0] >= 3:
+                hull = ConvexHull(points)
+                self.hull_vertices = points[hull.vertices]
+                
+                self.get_logger().info(f"Hull computed with {len(self.hull_vertices)} vertices")
+                self._publish_hull_visualization()
+        except Exception as e:
+            self.get_logger().error(f"Hull computation failed: {e}")
+            self.hull_vertices = points
+
+    def classify_points(self, candidate_points):
+        """
+        Classifies new points as:
+        0: Inside Hull (Part of Object)
+        1: Buffer Zone (Near boundary, ignore)
+        2: Unknown Seed (Outside boundary, use for new clusters)
+        """
+        if self.hull_vertices is None or len(self.hull_vertices) < 3:
+             # Fallback: Everything is unknown if we haven't learned the object yet
+            return np.full(len(candidate_points), 2)
+
+        from matplotlib.path import Path
+        hull_path = Path(self.hull_vertices)
+
+        is_inside = hull_path.contains_points(candidate_points)
+        labels = np.zeros(len(candidate_points), dtype=int)
+
+        for i, p in enumerate(candidate_points):
+            if is_inside[i]:
+                labels[i] = 0 # Object
+            else:
+                # Calculate min distance to hull vertices for buffer check
+                dists = np.linalg.norm(self.hull_vertices - p, axis=1)
+                min_dist = np.min(dists)
+
+                if min_dist < self.expansion_buffer:
+                    labels[i] = 1 # Buffer/Gap
+                else:
+                    labels[i] = 2 # Seed for Unknown
+        return labels   
     
+    def _recompute_geometry(self, merged_groups):
+        """Compute a convex hull for each cluster/label"""
+        
+        self.hull_vertices = {}  # Store multiple hulls: {label: vertices}
+        
+        for label, cells_dict in merged_groups.items():
+            # Collect points for this specific label
+            label_points = []
+            for (i, j) in cells_dict.keys():
+                map_pos = self.cell_to_map(i, j)
+                if map_pos is not None:
+                    label_points.append(map_pos)
+            
+            if len(label_points) < 3:
+                self.get_logger().warn(f"Label '{label}': Not enough points for hull ({len(label_points)})")
+                continue
+            
+            points = np.array(label_points)
+            
+            # Compute Convex Hull for this label
+            try:
+                if np.unique(points, axis=0).shape[0] >= 3:
+                    hull = ConvexHull(points)
+                    self.hull_vertices[label] = points[hull.vertices]
+                    self.get_logger().info(f"Label '{label}': Hull with {len(self.hull_vertices[label])} vertices")
+            except Exception as e:
+                self.get_logger().error(f"Label '{label}': Hull failed: {e}")
+                self.hull_vertices[label] = points
+        
+        # Publish all hulls
+        if self.hull_vertices:
+            self._publish_hull_visualization()
+
+
+    def _publish_hull_visualization(self):
+        """Publish a separate hull marker for each label"""
+        
+        if not self.hull_vertices:
+            self.get_logger().warn("No hull vertices to publish")
+            return
+        
+        marker_array = MarkerArray()
+        marker_id = 0
+        
+        for label, vertices in self.hull_vertices.items():
+            if len(vertices) < 3:
+                continue
+            
+            # Get color for this label (same as your semantic markers)
+            r, g, b = self.get_color_for_label(label)
+            
+            marker = Marker()
+            marker.header.frame_id = "map"
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "convex_hulls"
+            marker.id = marker_id
+            marker_id += 1
+            marker.type = Marker.LINE_STRIP
+            marker.action = Marker.ADD
+            
+            # Line properties
+            marker.scale.x = 0.08  # Line width
+            marker.color.r = r
+            marker.color.g = g
+            marker.color.b = b
+            marker.color.a = 1.0
+            marker.lifetime.sec = 1
+            marker.lifetime.nanosec = 0
+            
+            # Add hull vertices as a closed loop
+            for vertex in vertices:
+                p = Point()
+                p.x = float(vertex[0])
+                p.y = float(vertex[1])
+                p.z = 0.1  # Slightly above ground
+                marker.points.append(p)
+            
+            # Close the loop
+            p = Point()
+            p.x = float(vertices[0][0])
+            p.y = float(vertices[0][1])
+            p.z = 0.1
+            marker.points.append(p)
+            
+            marker_array.markers.append(marker)
+        
+        # Change publisher to MarkerArray
+        self.hull_viz_pub.publish(marker_array)
     
 def main(args=None):
     rclpy.init(args=args)
