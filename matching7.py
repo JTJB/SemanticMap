@@ -74,7 +74,7 @@ class LidarCamBasePolarNode(Node):
         self.bridge = CvBridge()
         # COCOデータセット基準 : person=0, chair=56, table=60
         self.target_classes = {'chair': 56, 'person': 0, 'table':60}
-        self.conf_threshold = 0.3 #0.3
+        self.conf_threshold = 0.1 #0.3
         
         # 2. Parameters
         # 解像度
@@ -145,7 +145,7 @@ class LidarCamBasePolarNode(Node):
         self.tracker = sort.SORT()
 
         # 10. Timer
-        self.create_timer(0.5, self.timer_callback)
+        self.create_timer(2.0, self.timer_callback)
         
         # 11. MarkerArray publisher (RViz視覚化)
         self.marker_pub = self.create_publisher(MarkerArray, "visualization_marker_array", 10)
@@ -277,7 +277,7 @@ class LidarCamBasePolarNode(Node):
         unknowns_file = self.folder + "/lidar_unknowns.txt"
         grid_file = self.folder + "/lidar_grid.txt"
         conf_file = self.folder + "/conf_grid.txt"
-        semantic_file = self.folder + "/semantic_grid.txt"
+        hull_file = self.folder + "/hull.txt"
 
         # 🔹 出力ディレクトリを自動作成
         output_dir = os.path.dirname(detections_file)
@@ -357,44 +357,10 @@ class LidarCamBasePolarNode(Node):
             groups[label][key] = groups[label].get(key, 0.0) + conf_val
 
         
-        # Initialize Union-Find with all labels
-        uf = UnionFind(list(groups.keys()))
-
-        # Compare all pairs of regions
-        labels_list = list(groups.keys())
-        merge_count = 0
-
-        for i in range(len(labels_list)):
-            for j in range(i + 1, len(labels_list)):
-                label1 = labels_list[i]
-                label2 = labels_list[j]
-                
-                region1 = set(groups[label1].keys())
-                region2 = set(groups[label2].keys())
-                
-                if are_regions_adjacent(region1, region2, max_distance=2):
-                    uf.union(label1, label2)
-                    merge_count += 1
-
-
-        # Build final merged groups with accumulated confidence
-        merged_groups = {}
-        for label, cells_dict in groups.items():
-            root_label = uf.find(label)
-            
-            if root_label not in merged_groups:
-                merged_groups[root_label] = {}
-            
-            # Accumulate confidence values for each cell
-            for cell, conf in cells_dict.items():
-                merged_groups[root_label][cell] = merged_groups[root_label].get(cell, 0.0) + conf
-
-
-        self._recompute_geometry(merged_groups)
 
         # 4. Write merged results
         conf_lines = []
-        for label, cells_dict in merged_groups.items():
+        for label, cells_dict in groups.items():
             for (i, j), confidence in cells_dict.items():
                 conf_lines.append(f"{label},{confidence},{i},{j},\n")  # Include confidence in output
 
@@ -502,12 +468,14 @@ class LidarCamBasePolarNode(Node):
                 row = line.split(',')
                 
                 label = row[0].strip()
+                confidence = float(row[1].strip())
                 x = float(row[2].strip())
                 y = float(row[3].strip())
                 if label not in tmp:
                     tmp[label] = set()
 
-                tmp[label].add((x, y))
+                if confidence > 5:
+                    tmp[label].add((x, y, confidence))
                 semantic_lines.append(f"{row[0]},({row[2]},{row[3]})\n")
         try:
             with open(semantic_file, "w") as f:
@@ -515,10 +483,101 @@ class LidarCamBasePolarNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to write semantic grid: {e}")
 
+
+        filtered_tmp = {}
+        semantic_lines = []
+        
+        MARGIN_MULTIPLIER = 0.7  # Adjust this: higher = more aggressive filtering
+        
+        for label, points in tmp.items():
+            if len(points) < 3:  # Skip labels with too few points
+                continue
+            
+            # Extract confidences for this label
+            confidences = np.array([conf for (x, y, conf) in points])
+            
+            # Calculate statistics
+            mean_conf = np.mean(confidences)
+            std_conf = np.std(confidences)
+            median_conf = np.median(confidences)
+            
+            # === CHOOSE YOUR THRESHOLD METHOD ===
+            
+            # Option 1: Mean + margin (good for normal distributions)
+            # threshold = mean_conf + MARGIN_MULTIPLIER * std_conf
+            
+            # Option 2: Percentile-based (keep top X%)
+            threshold = np.percentile(confidences, 90)  # Keep top 10%
+            
+            # Option 3: Median + fixed margin
+            # threshold = median_conf + 1.0
+            
+            # Option 4: Mean only (simpler)
+            # threshold = mean_conf * 1.2
+            
+            self.get_logger().info(
+                f"Label '{label}': mean={mean_conf:.2f}, std={std_conf:.2f}, "
+                f"threshold={threshold:.2f}, points={len(points)}"
+            )
+            
+            # Filter points above threshold
+            if label not in filtered_tmp:
+                filtered_tmp[label] = {}
+            for (x, y, conf) in points:
+                if conf >= threshold:
+                    key = (x, y)
+                    filtered_tmp[label][key] = conf
+                    semantic_lines.append(f"{label},({x},{y})\n")
+            
+                # Initialize Union-Find with all labels
+        uf = UnionFind(list(filtered_tmp.keys()))
+
+        # Compare all pairs of regions
+        labels_list = list(filtered_tmp.keys())
+        merge_count = 0
+
+        for i in range(len(labels_list)):
+            for j in range(i + 1, len(labels_list)):
+                label1 = labels_list[i]
+                label2 = labels_list[j]
+                
+                region1 = set(filtered_tmp[label1])
+                region2 = set(filtered_tmp[label2])
+                
+                if are_regions_adjacent(region1, region2, max_distance=2):
+                    uf.union(label1, label2)
+                    merge_count += 1
+
+
+        # Build final merged groups with accumulated confidence
+        # TODO when merging, assign a lower confidence to the previously assigned grids. Prioritize the current detection.
+        # start eliminating cells starting from the lowest confidence (tracking/decay/sensor drift)
+        # also, the cells that are outside the boundinc box should be continuously assigned negative confidence.
+        # oh, but this has an issue. what if the object is occluded in the current frame but visible in the previous frame?
+        # or, the object is just not visible because of the light
+        #basically should add confidence to all clusters and assumme the correct clusters have a significant higher confidence
+        #use margin instead of fixed threshold??
+
+        merged_groups = {}
+        for label, cells_dict in filtered_tmp.items():
+            root_label = uf.find(label)
+            
+            if root_label not in merged_groups:
+                merged_groups[root_label] = {}
+            
+            # Accumulate confidence values for each cell
+            for cell, conf in cells_dict.items():
+                merged_groups[root_label][cell] = merged_groups[root_label].get(cell, 0.0) + conf
+
+
+        self._recompute_geometry(merged_groups)
+
+
+
         # 5. Cube Marker & Text Marker pub
         markers = MarkerArray()
         marker_id = 0
-        for label, cells in tmp.items():
+        for label, cells in merged_groups.items():
 
             r, g, b = self.get_color_for_label(label)
 
@@ -823,8 +882,8 @@ class LidarCamBasePolarNode(Node):
             # cluster_idx = np.where(labels == largest_cluster_label)[0]
             cluster_idx = np.where(labels != -1)[0]
                     
-            filtered_matched_pts = [matched_pts_polar[i] for i in cluster_idx]
-            # filtered_matched_pts = matched_pts_polar
+            # filtered_matched_pts = [matched_pts_polar[i] for i in cluster_idx]
+            filtered_matched_pts = matched_pts_polar
 
 
             # (B) オドメトリ変化確認（移動しなければ保存しない）
@@ -925,7 +984,7 @@ class LidarCamBasePolarNode(Node):
         
         # Collect all cells from all labels
         all_points = []
-        for label, cells_dict in merged_groups.items():
+        for label, cells_dict, confidence in merged_groups.items():
             for (i, j) in cells_dict.keys():
                 # Convert grid cell to map coordinates
                 map_pos = self.cell_to_map(i, j)
