@@ -152,10 +152,14 @@ class LidarCamBasePolarNode(Node):
         self.hull_viz_pub = self.create_publisher(MarkerArray, '/hull_visualization', 10)
 
         # 12. occupancy値
-        self.occupancy_threshold =50
+        self.occupancy_threshold =70
         
         # 13. Image publisher
         self.image_pub = self.create_publisher(Image, '/kachaka/front_camera/uncompressed', 10)
+
+        # 14. Gaussian distribution parameters for adjacent cells
+        self.gaussian_sigma = 1.5  # Standard deviation for Gaussian distribution
+        self.gaussian_radius = 3   # How many cells around to consider (3 = 7x7 grid)
         
         
     # Markerの色設定
@@ -212,7 +216,7 @@ class LidarCamBasePolarNode(Node):
         self.map_info = {
             'width': width, 
             'height': height,
-            'resolution': resolution,
+            'resolution': resolution /2 , #original 0.05
             'origin_x': origin_x,
             'origin_y': origin_y,
             'yaw': yaw,
@@ -264,6 +268,16 @@ class LidarCamBasePolarNode(Node):
         x = origin_x + dx
         y = origin_y + dy
         return (x, y)
+    
+    def compute_gaussian_weight(self, distance):
+        """
+        Compute Gaussian weight based on distance from center cell.
+        Args:
+            distance: Euclidean distance in grid cells
+        Returns:
+            weight: Gaussian weight (0-1)
+        """
+        return math.exp(-(distance ** 2) / (2 * self.gaussian_sigma ** 2))
     
 
     # 2秒ごとにconf_grid.txtを読み込み、/map（OccupancyGrid）を参照して、conf_grid.txt内の各シードから8方向にBFS検索を実行し、その結果をsemantic_grid.txtファイルに保存し、MarkerArrayを生成してpub
@@ -370,6 +384,9 @@ class LidarCamBasePolarNode(Node):
                 f.writelines(conf_lines)
         except Exception as e:
             self.get_logger().error(f"Failed to write confidence grid: {e}")
+
+         # 🔹 ADD THIS: Generate confidence distribution plot
+        #self.visualize_confidence_distribution(conf_file)
             
         # 5. conf_grid.txt作成後、semantic marker関数を呼び出す
         self.publish_semantic_markers()
@@ -578,6 +595,8 @@ class LidarCamBasePolarNode(Node):
         markers = MarkerArray()
         marker_id = 0
         for label, cells in merged_groups.items():
+            if len(cells) < 4:
+                continue
 
             r, g, b = self.get_color_for_label(label)
 
@@ -860,7 +879,8 @@ class LidarCamBasePolarNode(Node):
                 filtered.append(pt)
         if matched_pts_polar:
 
-            filtered_matched_pts = matched_pts_polar
+            # removed DBSCAN
+            filtered_matched_pts = filtered
 
 
             # (B) オドメトリ変化確認（移動しなければ保存しない）
@@ -899,8 +919,50 @@ class LidarCamBasePolarNode(Node):
                             self.get_logger().warn(f"TF lookup failure: {e}")
                             continue                       
                         x_map, y_map = self.transform_point(x_robot, y_robot, transform)
+                        cell = self.cell_index(x_map, y_map)
+                        if cell is None:
+                            continue
+                        
+                        i, j = cell
+
+                        # === MODIFIED: GAUSSIAN DISTRIBUTION FOR ADJACENT CELLS ===
+                        # Write the center cell with full confidence
                         line = f"{timestamp},{clabel},{cconf:.2f},{x_map:.3f},{y_map:.3f}\n"
                         f.write(line)
+                        
+                        # Write adjacent cells with Gaussian-weighted confidence
+                        for di in range(-self.gaussian_radius, self.gaussian_radius + 1):
+                            for dj in range(-self.gaussian_radius, self.gaussian_radius + 1):
+                                if di == 0 and dj == 0:
+                                    continue  # Skip center (already written)
+                                
+                                # Calculate Euclidean distance
+                                distance = math.sqrt(di**2 + dj**2)
+                                
+                                # Skip if outside radius
+                                if distance > self.gaussian_radius:
+                                    continue
+                                
+                                # Compute Gaussian weight
+                                weight = self.compute_gaussian_weight(distance)
+                                
+                                # Calculate weighted confidence
+                                adjacent_conf = cconf * weight
+                                
+                                # Get adjacent cell coordinates
+                                adj_i = i + di
+                                adj_j = j + dj
+                                
+                                # Convert to map coordinates
+                                adj_map_pos = self.cell_to_map(adj_i, adj_j)
+                                if adj_map_pos is None:
+                                    continue
+                                
+                                adj_x, adj_y = adj_map_pos
+                                
+                                # Write adjacent cell
+                                adj_line = f"{timestamp},{clabel},{adjacent_conf:.2f},{adj_x:.3f},{adj_y:.3f}\n"
+                                f.write(adj_line)
             except Exception as e:
                 self.get_logger().error(f"Failed to write lidar detections: {e}")
         else:
@@ -1105,6 +1167,8 @@ class LidarCamBasePolarNode(Node):
         
         # Change publisher to MarkerArray
         self.hull_viz_pub.publish(marker_array)
+
+   
     
 def main(args=None):
     rclpy.init(args=args)

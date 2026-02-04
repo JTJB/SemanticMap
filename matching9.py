@@ -152,10 +152,14 @@ class LidarCamBasePolarNode(Node):
         self.hull_viz_pub = self.create_publisher(MarkerArray, '/hull_visualization', 10)
 
         # 12. occupancy値
-        self.occupancy_threshold =50
+        self.occupancy_threshold =70
         
         # 13. Image publisher
         self.image_pub = self.create_publisher(Image, '/kachaka/front_camera/uncompressed', 10)
+
+        # 14. Gaussian distribution parameters for adjacent cells
+        self.gaussian_sigma = 1.5  # Standard deviation for Gaussian distribution
+        self.gaussian_radius = 3   # How many cells around to consider (3 = 7x7 grid)
         
         
     # Markerの色設定
@@ -212,7 +216,7 @@ class LidarCamBasePolarNode(Node):
         self.map_info = {
             'width': width, 
             'height': height,
-            'resolution': resolution,
+            'resolution': 0.025, #original 0.05
             'origin_x': origin_x,
             'origin_y': origin_y,
             'yaw': yaw,
@@ -264,6 +268,17 @@ class LidarCamBasePolarNode(Node):
         x = origin_x + dx
         y = origin_y + dy
         return (x, y)
+
+
+    def compute_gaussian_weight(self, distance):
+        """
+        Compute Gaussian weight based on distance from center cell.
+        Args:
+            distance: Euclidean distance in grid cells
+        Returns:
+            weight: Gaussian weight (0-1)
+        """
+        return math.exp(-(distance ** 2) / (2 * self.gaussian_sigma ** 2))
     
 
     # 2秒ごとにconf_grid.txtを読み込み、/map（OccupancyGrid）を参照して、conf_grid.txt内の各シードから8方向にBFS検索を実行し、その結果をsemantic_grid.txtファイルに保存し、MarkerArrayを生成してpub
@@ -383,153 +398,81 @@ class LidarCamBasePolarNode(Node):
         semantic_file = self.folder + "/semantic_grid.txt"
         grid_file = self.folder + "/lidar_grid.txt"
 
-        # # 1. conf_grid.txt読み込み
-        # try:
-        #     with open(conf_file, "r") as f:
-        #         conf_lines = f.readlines()
-        # except Exception as e:
-        #     self.get_logger().error(f"Failed to read conf grid file: {e}")
-        #     return
-        # if not conf_lines:
-        #     self.get_logger().warn("No conf_lines found; skipping semantic marker publish.")
-        #     return
-
-        # # 2. /mapのOccupancyGrid情報を利用
-        # if self.map_info is None or 'grid_data' not in self.map_info:
-        #     self.get_logger().warn("Map info or grid_data not available yet.")
-        #     return
-        # occupancy_grid = self.map_info['grid_data']
-        # height = self.map_info['height']
-        # width = self.map_info['width']
-
-        # # 3. conf_grid.txtの各シードから8方向BFS検索実行
-        semantic_assignments = {}  # { label: set((i, j), ...) }
-        # for line in conf_lines:
-        #     line = line.strip()
-        #     if not line:
-        #         continue
-        #     parts = line.split(',')
-        #     if len(parts) != 4:
-        #         self.get_logger().warn(f"Unexpected conf grid line: {line}")
-        #         continue
-        #     label = parts[0]
-        #     try:
-        #         seed_i = int(parts[2])
-        #         seed_j = int(parts[3])
-        #     except Exception:
-        #         self.get_logger().warn(f"Failed to parse conf grid line: {line}")
-        #         continue
-        #     if seed_i < 0 or seed_i >= width or seed_j < 0 or seed_j >= height:
-        #         continue
-        #     if occupancy_grid[seed_j, seed_i] < self.occupancy_threshold:
-        #         continue
-
-        #     region = set()
-        #     queue = deque()
-        #     queue.append((seed_i, seed_j))
-        #     region.add((seed_i, seed_j))
-
-        #     directions = [(dx, dy) for dx in [-1, 0, 1] for dy in [-1, 0, 1] if not (dx == 0 and dy == 0)]
-        #     while queue and len(region) < 70:
-        #         cx, cy = queue.popleft()
-        #         for dx, dy in directions:
-        #             nx = cx + dx
-        #             ny = cy + dy
-
-        #             if nx < 0 or nx >= width or ny < 0 or ny >= height:
-        #                 continue
-        #             if (nx, ny) in region:
-        #                 continue
-        #             # if occupancy_grid[ny, nx] >= self.occupancy_threshold:
-        #             #     region.add((nx, ny))
-        #             #     queue.append((nx, ny))
-
-
-        #     # merge_regionの検索
-        #     merged_label = self.merge_region(label, region, semantic_assignments, threshold=0.5)
-        #     if merged_label in semantic_assignments:
-        #         semantic_assignments[merged_label] = semantic_assignments[merged_label].union(region)
-        #     else:
-        #         semantic_assignments[merged_label] = region
-
-        # 4. semantic_grid.txtに保存
-        semantic_lines = []
-        # for label, cells in semantic_assignments.items():
-        #     for (i, j) in cells:
-        #         semantic_lines.append(f"{label},{i},{j}\n")
-        # Read the file and parse each line
-        tmp = {}
+        try:
+            transform = self.tf_buffer.lookup_transform("map", "base_footprint", rclpy.time.Time())
+            robot_x = transform.transform.translation.x
+            robot_y = transform.transform.translation.y
+            q = transform.transform.rotation
+            robot_yaw = math.atan2(2 * (q.w * q.z + q.x * q.y),
+                                1 - 2 * (q.y * q.y + q.z * q.z))
+        except Exception as e:
+            self.get_logger().warn(f"Cannot get robot pose for cone filtering: {e}")
+            return
+        
+        # Read and group by label
+        label_data = {}  # {label: [(x, y, confidence), ...]}
+        
         with open(conf_file, "r") as f:
             for line in f:
                 line = line.strip()
-                if not line:  # Skip empty lines
+                if not line:
                     continue
                 
                 row = line.split(',')
-                
                 label = row[0].strip()
                 confidence = float(row[1].strip())
                 x = float(row[2].strip())
                 y = float(row[3].strip())
-                if label not in tmp:
-                    tmp[label] = set()
-
-                if confidence > 5:
-                    tmp[label].add((x, y, confidence))
-                semantic_lines.append(f"{row[0]},({row[2]},{row[3]})\n")
-        try:
-            with open(semantic_file, "w") as f:
-                f.writelines(semantic_lines)
-        except Exception as e:
-            self.get_logger().error(f"Failed to write semantic grid: {e}")
-
-
+                
+                if label not in label_data:
+                    label_data[label] = []
+                
+                label_data[label].append((x, y, confidence))
+        
+        # === MODIFIED: CONE FILTER ONLY FOR UPDATING, NOT DELETING ===
         filtered_tmp = {}
         semantic_lines = []
         
-        MARGIN_MULTIPLIER = 0.7  # Adjust this: higher = more aggressive filtering
+        CONE_ANGLE = 120  # degrees (60° on each side)
+        MAX_CONE_DISTANCE = 4.0  # meters
         
-        for label, points in tmp.items():
-            if len(points) < 3:  # Skip labels with too few points
+        for label, points in label_data.items():
+            if len(points) < 3:
                 continue
             
-            # Extract confidences for this label
-            confidences = np.array([conf for (x, y, conf) in points])
+            # Separate points into cone and non-cone
+            cone_points = []
+            non_cone_points = []
             
-            # Calculate statistics
-            mean_conf = np.mean(confidences)
-            std_conf = np.std(confidences)
-            median_conf = np.median(confidences)
-            
-            # === CHOOSE YOUR THRESHOLD METHOD ===
-            
-            # Option 1: Mean + margin (good for normal distributions)
-            # threshold = mean_conf + MARGIN_MULTIPLIER * std_conf
-            
-            # Option 2: Percentile-based (keep top X%)
-            threshold = np.percentile(confidences, 80)  # Keep top 10%
-            
-            # Option 3: Median + fixed margin
-            # threshold = median_conf + 1.0
-            
-            # Option 4: Mean only (simpler)
-            # threshold = mean_conf * 1.2
-            
-            self.get_logger().info(
-                f"Label '{label}': mean={mean_conf:.2f}, std={std_conf:.2f}, "
-                f"threshold={threshold:.2f}, points={len(points)}"
-            )
-            
-            # Filter points above threshold
-            if label not in filtered_tmp:
-                filtered_tmp[label] = {}
             for (x, y, conf) in points:
-                if conf >= threshold:
-                    key = (x, y)
-                    filtered_tmp[label][key] = conf
-                    semantic_lines.append(f"{label},({x},{y})\n")
+                # Convert grid cell to map coordinates
+                map_pos = self.cell_to_map(int(x), int(y))
+                if map_pos is None:
+                    continue
+                
+                map_x, map_y = map_pos
+                
+                # Check if in cone
+                if self.is_point_in_cone(map_x, map_y, robot_x, robot_y, robot_yaw,
+                                        cone_angle=CONE_ANGLE, 
+                                        max_distance=MAX_CONE_DISTANCE):
+                    cone_points.append((x, y, conf))
+                else:
+                    non_cone_points.append((x, y, conf))
             
-        # Initialize Union-Find with all labels
+            # === CONE FILTERING: Only apply threshold to cone points ===
+            if len(cone_points) >= 3:
+                cone_confidences = np.array([conf for (x, y, conf) in cone_points])
+                threshold = np.percentile(cone_confidences, 95)  # Keep top 50% in cone
+                
+                self.get_logger().info(
+                    f"Label '{label}': cone_points={len(cone_points)}, "
+                    f"non_cone_points={len(non_cone_points)}, threshold={threshold:.2f}"
+                )
+            else:
+                threshold = 0.0  # If not enough cone points, keep all
+            
+                # Initialize Union-Find with all labels
         uf = UnionFind(list(filtered_tmp.keys()))
 
         # Compare all pairs of regions
@@ -877,6 +820,7 @@ class LidarCamBasePolarNode(Node):
             # (C) 点群をmap座標に変換後、lidar_detections.txtファイルに保存
             timestamp = f"{sec},{nsec}"
             detections_file = self.folder + "/lidar_detections.txt"
+            ADJACENT_CONFIDENCE_RATIO = 0.2 
             try:
                 with open(detections_file, "a") as f:
                     for pt in filtered_matched_pts:
@@ -886,12 +830,7 @@ class LidarCamBasePolarNode(Node):
                             continue                       
                         x_robot = r * math.sin(th + math.pi) + 0.156
                         y_robot = -r * math.cos(th + math.pi)
-                        # x_robot = new_range * math.cos(new_angle)
-                        # y_robot = new_range * math.sin(new_angle)   
-                        
-                        
-                        # x_robot = r * math.cos(th)
-                        # y_robot = r * math.sin(th)
+
                                              
                         try:
                             transform = self.tf_buffer.lookup_transform("map", "base_footprint", rclpy.time.Time())
@@ -899,8 +838,51 @@ class LidarCamBasePolarNode(Node):
                             self.get_logger().warn(f"TF lookup failure: {e}")
                             continue                       
                         x_map, y_map = self.transform_point(x_robot, y_robot, transform)
+
+                        cell = self.cell_index(x_map, y_map)
+                        if cell is None:
+                            continue
+                        
+                        i, j = cell
+
+                        # === MODIFIED: GAUSSIAN DISTRIBUTION FOR ADJACENT CELLS ===
+                        # Write the center cell with full confidence
                         line = f"{timestamp},{clabel},{cconf:.2f},{x_map:.3f},{y_map:.3f}\n"
                         f.write(line)
+                        
+                        # Write adjacent cells with Gaussian-weighted confidence
+                        for di in range(-self.gaussian_radius, self.gaussian_radius + 1):
+                            for dj in range(-self.gaussian_radius, self.gaussian_radius + 1):
+                                if di == 0 and dj == 0:
+                                    continue  # Skip center (already written)
+                                
+                                # Calculate Euclidean distance
+                                distance = math.sqrt(di**2 + dj**2)
+                                
+                                # Skip if outside radius
+                                if distance > self.gaussian_radius:
+                                    continue
+                                
+                                # Compute Gaussian weight
+                                weight = self.compute_gaussian_weight(distance)
+                                
+                                # Calculate weighted confidence
+                                adjacent_conf = cconf * weight
+                                
+                                # Get adjacent cell coordinates
+                                adj_i = i + di
+                                adj_j = j + dj
+                                
+                                # Convert to map coordinates
+                                adj_map_pos = self.cell_to_map(adj_i, adj_j)
+                                if adj_map_pos is None:
+                                    continue
+                                
+                                adj_x, adj_y = adj_map_pos
+                                
+                                # Write adjacent cell
+                                adj_line = f"{timestamp},{clabel},{adjacent_conf:.2f},{adj_x:.3f},{adj_y:.3f}\n"
+                                f.write(adj_line)
             except Exception as e:
                 self.get_logger().error(f"Failed to write lidar detections: {e}")
         else:
@@ -1105,6 +1087,43 @@ class LidarCamBasePolarNode(Node):
         
         # Change publisher to MarkerArray
         self.hull_viz_pub.publish(marker_array)
+
+    def is_point_in_cone(self, point_x, point_y, robot_x, robot_y, robot_yaw, 
+                     cone_angle=90, max_distance=3.0):
+        """
+        Check if a point is within a cone in front of the robot.
+        
+        Args:
+            point_x, point_y: Point coordinates in map frame
+            robot_x, robot_y: Robot position in map frame
+            robot_yaw: Robot orientation (radians)
+            cone_angle: Cone angle in degrees (e.g., 90 = 45° on each side)
+            max_distance: Maximum distance to consider (meters)
+        
+        Returns:
+            True if point is in cone, False otherwise
+        """
+        # Vector from robot to point
+        dx = point_x - robot_x
+        dy = point_y - robot_y
+        
+        # Distance check
+        distance = math.sqrt(dx**2 + dy**2)
+        if distance > max_distance or distance < 0.1:  # Too far or too close
+            return False
+        
+        # Angle from robot to point
+        angle_to_point = math.atan2(dy, dx)
+        
+        # Difference between robot's heading and angle to point
+        angle_diff = angle_to_point - robot_yaw
+        
+        # Normalize to [-pi, pi]
+        angle_diff = math.atan2(math.sin(angle_diff), math.cos(angle_diff))
+        
+        # Check if within cone
+        half_cone = math.radians(cone_angle / 2)
+        return abs(angle_diff) <= half_cone
     
 def main(args=None):
     rclpy.init(args=args)

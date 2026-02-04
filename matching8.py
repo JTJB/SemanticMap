@@ -43,6 +43,7 @@ def are_regions_adjacent(region1, region2, max_distance=2):
                 return True
     return False
 
+
 # Union-Find structure for efficient merging
 class UnionFind:
     def __init__(self, labels):
@@ -152,7 +153,7 @@ class LidarCamBasePolarNode(Node):
         self.hull_viz_pub = self.create_publisher(MarkerArray, '/hull_visualization', 10)
 
         # 12. occupancy値
-        self.occupancy_threshold =50
+        self.occupancy_threshold =70
         
         # 13. Image publisher
         self.image_pub = self.create_publisher(Image, '/kachaka/front_camera/uncompressed', 10)
@@ -212,13 +213,13 @@ class LidarCamBasePolarNode(Node):
         self.map_info = {
             'width': width, 
             'height': height,
-            'resolution': resolution,
+            'resolution': 0.1, #original 0.05
             'origin_x': origin_x,
             'origin_y': origin_y,
             'yaw': yaw,
             'grid_data': grid_data
         }
-        self.get_logger().error("Map updated. ")
+        self.get_logger().error(f"Map updated with resolution: {resolution:.2f}.")
     
     
     # (x, y)座標を/map基準のgrid cell (i, j)に変換
@@ -507,7 +508,7 @@ class LidarCamBasePolarNode(Node):
             # threshold = mean_conf + MARGIN_MULTIPLIER * std_conf
             
             # Option 2: Percentile-based (keep top X%)
-            threshold = np.percentile(confidences, 80)  # Keep top 10%
+            threshold = np.percentile(confidences, 90)  # Keep top 10%
             
             # Option 3: Median + fixed margin
             # threshold = median_conf + 1.0
@@ -529,12 +530,14 @@ class LidarCamBasePolarNode(Node):
                     filtered_tmp[label][key] = conf
                     semantic_lines.append(f"{label},({x},{y})\n")
             
-        # Initialize Union-Find with all labels
+                # Initialize Union-Find with all labels
         uf = UnionFind(list(filtered_tmp.keys()))
 
         # Compare all pairs of regions
         labels_list = list(filtered_tmp.keys())
         merge_count = 0
+
+        OVERLAP_THRESHOLD = 0.5  # Merge if 50%+ overlap
 
         for i in range(len(labels_list)):
             for j in range(i + 1, len(labels_list)):
@@ -544,10 +547,16 @@ class LidarCamBasePolarNode(Node):
                 region1 = set(filtered_tmp[label1])
                 region2 = set(filtered_tmp[label2])
                 
-                if are_regions_adjacent(region1, region2, max_distance=2):
+                #  Calculate overlap ratio
+                overlap = self.compute_overlap_ratio(region1, region2)
+                
+                if overlap >= OVERLAP_THRESHOLD:
                     uf.union(label1, label2)
                     merge_count += 1
-
+                    self.get_logger().info(
+                        f"Merging '{label1}' and '{label2}' "
+                        f"(overlap: {overlap:.2%}, cells: {len(region1)} & {len(region2)})"
+                    )
 
         # Build final merged groups with accumulated confidence
         # TODO when merging, assign a lower confidence to the previously assigned grids. Prioritize the current detection.
@@ -750,7 +759,7 @@ class LidarCamBasePolarNode(Node):
         point_cloud = np.stack([x, y], axis=1)
         self.lidar_msgs.append((msg, ts, point_cloud))
 
-    # def lidar_callback(self, msg):
+    # def lidar_callback(self, msg): #PointCloud2 version
     #     self.get_logger().info("LiDAR message received")
     #     ts = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
     #     points = list(point_cloud2.read_points(msg, field_names=("x", "y"), skip_nans=True) )
@@ -765,7 +774,7 @@ class LidarCamBasePolarNode(Node):
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
         self.current_odometry = (x, y)
-        self.get_logger().info(f"Odometry updated: x={x:.2f}, y={y:.2f}")
+        # self.get_logger().info(f"Odometry updated: x={x:.2f}, y={y:.2f}")
     
     
     # バウンディングボックス内のLiDAR点群のマッチング処理
@@ -859,10 +868,6 @@ class LidarCamBasePolarNode(Node):
             if r < min_depth + 0.3:
                 filtered.append(pt)
         if matched_pts_polar:
-
-            filtered_matched_pts = matched_pts_polar
-
-
             # (B) オドメトリ変化確認（移動しなければ保存しない）
             if self.current_odometry is not None:
                 if self.last_saved_odometry is not None:
@@ -870,7 +875,7 @@ class LidarCamBasePolarNode(Node):
                     dy = self.current_odometry[1] - self.last_saved_odometry[1]
                     distance = math.sqrt(dx**2 + dy**2)
                     if distance < self.odom_threshold:
-                        self.get_logger().info("No odometry change")
+                        # self.get_logger().info("No odometry change")
                         return
                 self.last_saved_odometry = self.current_odometry
             
@@ -879,7 +884,7 @@ class LidarCamBasePolarNode(Node):
             detections_file = self.folder + "/lidar_detections.txt"
             try:
                 with open(detections_file, "a") as f:
-                    for pt in filtered_matched_pts:
+                    for pt in matched_pts_polar:
                         r, th, clabel, cconf = pt
                         # 信頼度フィルタリング
                         if cconf < self.conf_threshold:
@@ -953,8 +958,8 @@ class LidarCamBasePolarNode(Node):
                     best_iou = iou
                     best_label = det['label']
             combined_label = f"{best_label}{track_id}" if best_label is not None else f"unknown{track_id}"
-            self.get_logger().info(f"Tracking box created: {combined_label}")
-        self.get_logger().info("Tracking result update complete")
+            # self.get_logger().info(f"Tracking box created: {combined_label}")
+        # self.get_logger().info("Tracking result update complete")
 
     def _recompute_geometry(self, merged_groups):
         """Extract all cell positions and compute convex hull"""
@@ -980,7 +985,7 @@ class LidarCamBasePolarNode(Node):
                 hull = ConvexHull(points)
                 self.hull_vertices = points[hull.vertices]
                 
-                self.get_logger().info(f"Hull computed with {len(self.hull_vertices)} vertices")
+                # self.get_logger().info(f"Hull computed with {len(self.hull_vertices)} vertices")
                 self._publish_hull_visualization()
         except Exception as e:
             self.get_logger().error(f"Hull computation failed: {e}")
@@ -1041,7 +1046,7 @@ class LidarCamBasePolarNode(Node):
                 if np.unique(points, axis=0).shape[0] >= 3:
                     hull = ConvexHull(points)
                     self.hull_vertices[label] = points[hull.vertices]
-                    self.get_logger().info(f"Label '{label}': Hull with {len(self.hull_vertices[label])} vertices")
+                    # self.get_logger().info(f"Label '{label}': Hull with {len(self.hull_vertices[label])} vertices")
             except Exception as e:
                 self.get_logger().error(f"Label '{label}': Hull failed: {e}")
                 self.hull_vertices[label] = points
@@ -1105,6 +1110,21 @@ class LidarCamBasePolarNode(Node):
         
         # Change publisher to MarkerArray
         self.hull_viz_pub.publish(marker_array)
+    def compute_overlap_ratio(self, region1, region2):
+        """
+        Compute overlap ratio between two regions.
+        Returns the ratio of intersection to the smaller region.
+        """
+        intersection = region1.intersection(region2)
+        if len(intersection) == 0:
+            return 0.0
+        
+        # Overlap coefficient: intersection / min(region sizes)
+        # This means if small region is 80% contained in large region, ratio = 0.8
+        min_size = min(len(region1), len(region2))
+        overlap_ratio = len(intersection) / min_size
+        
+        return overlap_ratio
     
 def main(args=None):
     rclpy.init(args=args)
